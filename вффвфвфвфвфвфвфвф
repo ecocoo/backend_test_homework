@@ -1,0 +1,167 @@
+from dataclasses import dataclass
+from environs import Env
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.filters import BaseFilter, Command, CommandStart
+from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+import logging
+import asyncio
+from copy import deepcopy
+
+# Настройки конфигурации
+@dataclass
+class TgBot:
+    token: str 
+
+@dataclass
+class Config:
+    tg_bot: TgBot
+
+def load_config(path: str | None = None) -> Config:
+    env = Env()
+    env.read_env(path)
+    return Config(tg_bot=TgBot(token=env('BOT_TOKEN')))
+
+# Шаблон словаря пользователя и база данных пользователей
+user_dict_template = {'page': 1, 'bookmarks': set()}
+users_db = {}
+
+# Фильтры для обработки нажатий на кнопки
+class IsDigitCallbackData(BaseFilter):
+    async def __call__(self, callback: CallbackQuery) -> bool:
+        return callback.data.isdigit()
+
+class IsDelBookmarkCallbackData(BaseFilter):
+    async def __call__(self, callback: CallbackQuery) -> bool:
+        return callback.data.endswith('del') and callback.data[:-3].isdigit()
+
+# Загрузка книги
+BOOK_PATH = '/Users/vladsudoplatov/VsCODE Project/tg_bot/book/Witcher_part_1.txt'
+PAGE_SIZE = 1050
+book = {}
+
+def _get_page_text(text, start, size):
+    end = min(start + size, len(text))
+    return text[start:end].strip(), end - start
+
+def prepare_book(path):
+    with open(path, 'r', encoding='utf-8') as file:
+        text = file.read()
+    start, page_number = 0, 1
+    while start < len(text):
+        page_text, page_size = _get_page_text(text, start, PAGE_SIZE)
+        book[page_number] = page_text
+        start += page_size
+        page_number += 1
+
+prepare_book(BOOK_PATH)
+
+# Лексикон
+LEXICON = {
+    'forward': '>>', 'backward': '<<',
+    '/start': '<b>Привет, читатель!</b> Чтобы узнать доступные команды, набери /help',
+    '/help': '<b>Команды бота:</b>\n\n/beginning - В начало\n/continue - Продолжить\n/bookmarks - Закладки\n/help - Справка',
+    '/bookmarks': '<b>Ваши закладки:</b>', 'edit_bookmarks': '<b>Редактировать закладки</b>',
+    'edit_bookmarks_button': '❌ РЕДАКТИРОВАТЬ', 'del': '❌', 'cancel': 'ОТМЕНИТЬ', 
+    'no_bookmarks': 'Закладок пока нет. /continue - продолжить', 'cancel_text': '/continue - продолжить'
+}
+LEXICON_COMMANDS = {'/beginning': 'В начало книги', '/continue': 'Продолжить', '/bookmarks': 'Закладки', '/help': 'Справка'}
+
+# Клавиатуры
+def create_pagination_keyboard(*buttons: str) -> InlineKeyboardMarkup:
+    kb_builder = InlineKeyboardBuilder()
+    kb_builder.row(*[InlineKeyboardButton(text=LEXICON.get(button, button), callback_data=button) for button in buttons])
+    return kb_builder.as_markup()
+
+def create_bookmarks_keyboard(*args: int) -> InlineKeyboardMarkup:
+    kb_builder = InlineKeyboardBuilder()
+    for button in sorted(args):
+        kb_builder.row(InlineKeyboardButton(text=f'{button} - {book[button][:100]}', callback_data=str(button)))
+    kb_builder.row(
+        InlineKeyboardButton(text=LEXICON['edit_bookmarks_button'], callback_data='edit_bookmarks'),
+        InlineKeyboardButton(text=LEXICON['cancel'], callback_data='cancel'), width=2)
+    return kb_builder.as_markup()
+
+def create_edit_keyboard(*args: int) -> InlineKeyboardMarkup:
+    kb_builder = InlineKeyboardBuilder()
+    for button in sorted(args):
+        kb_builder.row(InlineKeyboardButton(text=f'{LEXICON["del"]} {button} - {book[button][:100]}', callback_data=f'{button}del'))
+    kb_builder.row(InlineKeyboardButton(text=LEXICON['cancel'], callback_data='cancel'))
+    return kb_builder.as_markup()
+
+# Хэндлеры команд
+router = Router()
+
+@router.message(CommandStart())
+async def process_start_command(message: Message):
+    await message.answer(LEXICON[message.text])
+    if message.from_user.id not in users_db:
+        users_db[message.from_user.id] = deepcopy(user_dict_template)
+
+@router.message(Command(commands='help'))
+async def process_help_command(message: Message):
+    await message.answer(LEXICON[message.text])
+
+@router.message(Command(commands='beginning'))
+async def process_beginning_command(message: Message):
+    users_db[message.from_user.id]['page'] = 1
+    text = book[users_db[message.from_user.id]['page']]
+    await message.answer(text=text, reply_markup=create_pagination_keyboard('backward', f'{users_db[message.from_user.id]["page"]}/{len(book)}', 'forward'))
+
+@router.message(Command(commands='continue'))
+async def process_continue_command(message: Message):
+    text = book[users_db[message.from_user.id]['page']]
+    await message.answer(text=text, reply_markup=create_pagination_keyboard('backward', f'{users_db[message.from_user.id]["page"]}/{len(book)}', 'forward'))
+
+@router.message(Command(commands='bookmarks'))
+async def process_bookmarks_command(message: Message):
+    bookmarks = users_db[message.from_user.id]["bookmarks"]
+    if bookmarks:
+        await message.answer(text=LEXICON[message.text], reply_markup=create_bookmarks_keyboard(*bookmarks))
+    else:
+        await message.answer(text=LEXICON['no_bookmarks'])
+
+# Хэндлеры кнопок
+@router.callback_query(F.data == 'forward')
+async def process_forward_press(callback: CallbackQuery):
+    if users_db[callback.from_user.id]['page'] < len(book):
+        users_db[callback.from_user.id]['page'] += 1
+        text = book[users_db[callback.from_user.id]['page']]
+        await callback.message.edit_text(text=text, reply_markup=create_pagination_keyboard('backward', f'{users_db[callback.from_user.id]["page"]}/{len(book)}', 'forward'))
+    await callback.answer()
+
+@router.callback_query(F.data == 'backward')
+async def process_backward_press(callback: CallbackQuery):
+    if users_db[callback.from_user.id]['page'] > 1:
+        users_db[callback.from_user.id]['page'] -= 1
+        text = book[users_db[callback.from_user.id]['page']]
+        await callback.message.edit_text(text=text, reply_markup=create_pagination_keyboard('backward', f'{users_db[callback.from_user.id]["page"]}/{len(book)}', 'forward'))
+    await callback.answer()
+
+@router.callback_query(IsDigitCallbackData())
+async def process_bookmark_press(callback: CallbackQuery):
+    text = book[int(callback.data)]
+    users_db[callback.from_user.id]['page'] = int(callback.data)
+    await callback.message.edit_text(text=text, reply_markup=create_pagination_keyboard('backward', f'{users_db[callback.from_user.id]["page"]}/{len(book)}', 'forward'))
+
+@router.callback_query(IsDelBookmarkCallbackData())
+async def process_del_bookmark_press(callback: CallbackQuery):
+    users_db[callback.from_user.id]['bookmarks'].remove(int(callback.data[:-3]))
+    bookmarks = users_db[callback.from_user.id]["bookmarks"]
+    await callback.message.edit_text(text=LEXICON['/bookmarks'] if bookmarks else LEXICON['no_bookmarks'], reply_markup=create_edit_keyboard(*bookmarks) if bookmarks else None)
+
+# Настройка и запуск бота
+async def set_main_menu(bot: Bot):
+    await bot.set_my_commands([BotCommand(command, description) for command, description in LEXICON_COMMANDS.items()])
+
+async def main():
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(message)s')
+    config = load_config()
+    bot = Bot(token=config.tg_bot.token)
+    dp = Dispatcher()
+    await set_main_menu(bot)
+    dp.include_router(router)
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+asyncio.run(main())
